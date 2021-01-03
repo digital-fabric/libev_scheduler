@@ -44,6 +44,7 @@ typedef struct Scheduler_t {
   struct ev_async break_async;
 
   unsigned int currently_polling;
+  VALUE ready; // holds ready fibers (used only while polling)
 } Scheduler_t;
 
 static size_t Scheduler_size(const void *ptr) {
@@ -87,15 +88,73 @@ static VALUE Scheduler_initialize(VALUE self) {
   return Qnil;
 }
 
+VALUE Scheduler_poll(VALUE self);
+
 VALUE Scheduler_close(VALUE self) {
   Scheduler_t *scheduler;
   GetScheduler(self, scheduler);
 
-   ev_async_stop(scheduler->ev_loop, &scheduler->break_async);
+  Scheduler_poll(self);
+
+  ev_async_stop(scheduler->ev_loop, &scheduler->break_async);
 
   if (!ev_is_default_loop(scheduler->ev_loop)) ev_loop_destroy(scheduler->ev_loop);
   return self;
 }
+
+struct libev_timer {
+  struct ev_timer timer;
+  Scheduler_t *scheduler;
+  VALUE fiber;
+};
+
+void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents)
+{
+  struct libev_timer *timer = (struct libev_timer *)w;
+  rb_ary_push(timer->scheduler->ready, timer->fiber);
+}
+
+VALUE Scheduler_sleep(VALUE self, VALUE duration) {
+  Scheduler_t *scheduler;
+  struct libev_timer timer;
+  GetScheduler(self, scheduler);
+
+  timer.scheduler = scheduler;
+  timer.fiber = rb_fiber_current();
+  ev_timer_init(&timer.timer, Scheduler_timer_callback, NUM2DBL(duration), 0.);
+  ev_timer_start(scheduler->ev_loop, &timer.timer);
+  VALUE nil = Qnil;
+  VALUE ret = rb_fiber_yield(1, &nil);
+  ev_timer_stop(scheduler->ev_loop, &timer.timer);
+  return ret;
+}
+
+VALUE Scheduler_pause(VALUE self) {
+  Scheduler_t *scheduler;
+  GetScheduler(self, scheduler);
+
+  ev_ref(scheduler->ev_loop);
+  VALUE nil = Qnil;
+  VALUE ret = rb_fiber_yield(1, &nil);
+  ev_unref(scheduler->ev_loop);
+  return ret;
+}
+
+VALUE Scheduler_block(int argc, VALUE *argv, VALUE self) {
+  VALUE timeout = (argc == 2) ? argv[1] : Qnil;
+
+  if (timeout != Qnil) return Scheduler_sleep(self, timeout);
+  return Scheduler_pause(self);
+}
+
+VALUE Scheduler_unblock(VALUE self, VALUE blocker, VALUE fiber) {
+  printf("unblock?\n");
+  return self;
+}
+
+
+
+
 
 VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE duration) {
   return self;
@@ -105,38 +164,23 @@ VALUE Scheduler_process_wait(VALUE self, VALUE pid, VALUE flags) {
   return self;
 }
 
-VALUE Scheduler_kernel_sleep(int argc, VALUE *argv, VALUE self) {
-  return self;
-}
+VALUE Scheduler_poll(VALUE self) {
+  Scheduler_t *scheduler;
+  GetScheduler(self, scheduler);
 
-VALUE Scheduler_block(int argc, VALUE *argv, VALUE self) {
-  return self;
-}
+  scheduler->ready = rb_ary_new();
+  scheduler->currently_polling = 1;
+  ev_run(scheduler->ev_loop, EVRUN_ONCE);
+  scheduler->currently_polling = 0;
 
-VALUE Scheduler_unblock(VALUE self, VALUE blocker, VALUE fiber) {
-  return self;
-}
-
-VALUE Scheduler_poll(VALUE self, VALUE nowait, VALUE current_fiber, VALUE runqueue) {
-  int is_nowait = nowait == Qtrue;
-  Scheduler_t *backend;
-  GetScheduler(self, backend);
-
-  if (is_nowait) {
-    // backend->poll_no_wait_count++;
-    // if (backend->poll_no_wait_count < 10) return self;
-
-    // long runnable_count = Runqueue_len(runqueue);
-    // if (backend->poll_no_wait_count < runnable_count) return self;
+  unsigned int ready_count = RARRAY_LEN(scheduler->ready);
+  VALUE nil = Qnil;
+  for (unsigned int i = 0; i < ready_count; i++) {
+    VALUE fiber = RARRAY_AREF(scheduler->ready, i);
+    rb_fiber_resume(fiber, 1, &nil);
   }
 
-  // backend->poll_no_wait_count = 0;
-
-  // COND_TRACE(2, SYM_fiber_event_poll_enter, current_fiber);
-  backend->currently_polling = 1;
-  ev_run(backend->ev_loop, is_nowait ? EVRUN_NOWAIT : EVRUN_ONCE);
-  backend->currently_polling = 0;
-  // COND_TRACE(2, SYM_fiber_event_poll_leave, current_fiber);
+  RB_GC_GUARD(scheduler->ready);
 
   return self;
 }
@@ -209,102 +253,6 @@ VALUE Scheduler_wait_io(VALUE self, VALUE io, VALUE write) {
   return libev_wait_fd(backend, fptr->fd, events, 1);
 }
 
-struct libev_timer {
-  struct ev_timer timer;
-  VALUE fiber;
-};
-
-void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents)
-{
-  struct libev_timer *watcher = (struct libev_timer *)w;
-  Fiber_make_runnable(watcher->fiber, Qnil);
-}
-
-VALUE Scheduler_sleep(VALUE self, VALUE duration) {
-  Scheduler_t *backend;
-  struct libev_timer watcher;
-  VALUE switchpoint_result = Qnil;
-
-  GetScheduler(self, backend);
-  watcher.fiber = rb_fiber_current();
-  ev_timer_init(&watcher.timer, Scheduler_timer_callback, NUM2DBL(duration), 0.);
-  ev_timer_start(backend->ev_loop, &watcher.timer);
-
-  switchpoint_result = backend_await(backend);
-
-  ev_timer_stop(backend->ev_loop, &watcher.timer);
-  RAISE_IF_EXCEPTION(switchpoint_result);
-  RB_GC_GUARD(watcher.fiber);
-  RB_GC_GUARD(switchpoint_result);
-  return switchpoint_result;
-}
-
-VALUE Scheduler_timeout_safe(VALUE arg) {
-  return rb_yield(arg);
-}
-
-VALUE Scheduler_timeout_rescue(VALUE arg, VALUE exception) {
-  return exception;
-}
-
-VALUE Scheduler_timeout_ensure_safe(VALUE arg) {
-  return rb_rescue2(Scheduler_timeout_safe, Qnil, Scheduler_timeout_rescue, Qnil, rb_eException, (VALUE)0);
-}
-
-struct libev_timeout {
-  struct ev_timer timer;
-  VALUE fiber;
-  VALUE resume_value;
-};
-
-struct Scheduler_timeout_ctx {
-  Scheduler_t *backend;
-  struct libev_timeout *watcher;
-};
-
-VALUE Scheduler_timeout_ensure(VALUE arg) {
-  struct Scheduler_timeout_ctx *timeout_ctx = (struct Scheduler_timeout_ctx *)arg;
-  ev_timer_stop(timeout_ctx->backend->ev_loop, &(timeout_ctx->watcher->timer));
-  return Qnil;
-}
-
-void Scheduler_timeout_callback(EV_P_ ev_timer *w, int revents)
-{
-  struct libev_timeout *watcher = (struct libev_timeout *)w;
-  Fiber_make_runnable(watcher->fiber, watcher->resume_value);
-}
-
-// VALUE Scheduler_timeout(int argc,VALUE *argv, VALUE self) {
-//   VALUE duration;
-//   VALUE exception;
-//   VALUE move_on_value = Qnil;
-//   rb_scan_args(argc, argv, "21", &duration, &exception, &move_on_value);
-
-//   Scheduler_t *backend;
-//   struct libev_timeout watcher;
-//   VALUE result = Qnil;
-//   VALUE timeout = rb_funcall(cTimeoutException, ID_new, 0);
-
-//   GetScheduler(self, backend);
-//   watcher.fiber = rb_fiber_current();
-//   watcher.resume_value = timeout;
-//   ev_timer_init(&watcher.timer, Scheduler_timeout_callback, NUM2DBL(duration), 0.);
-//   ev_timer_start(backend->ev_loop, &watcher.timer);
-
-//   struct Scheduler_timeout_ctx timeout_ctx = {backend, &watcher};
-//   result = rb_ensure(Scheduler_timeout_ensure_safe, Qnil, Scheduler_timeout_ensure, (VALUE)&timeout_ctx);
-  
-//   if (result == timeout) {
-//     if (exception == Qnil) return move_on_value;
-//     RAISE_EXCEPTION(backend_timeout_exception(exception));
-//   }
-
-//   RAISE_IF_EXCEPTION(result);
-//   RB_GC_GUARD(result);
-//   RB_GC_GUARD(timeout);
-//   return result;
-// }
-
 struct libev_child {
   struct ev_child child;
   VALUE fiber;
@@ -375,7 +323,6 @@ void Init_Scheduler() {
   // fiber scheduler interface
   rb_define_method(cScheduler, "close", Scheduler_close, 0);
   rb_define_method(cScheduler, "io_wait", Scheduler_io_wait, 3);
-  rb_define_method(cScheduler, "kernel_sleep", Scheduler_kernel_sleep, -1);
   rb_define_method(cScheduler, "process_wait", Scheduler_process_wait, 2);
   rb_define_method(cScheduler, "block", Scheduler_block, -1);
   rb_define_method(cScheduler, "unblock", Scheduler_unblock, 2);
