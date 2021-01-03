@@ -15,34 +15,16 @@
 ID ID_ivar_is_nonblocking;
 ID ID_ivar_io;
 
+int event_readable;
+int event_writable;
+
 // VALUE SYM_libev;
-
-// Since we need to ensure that fd's are non-blocking before every I/O
-// operation, here we improve upon Ruby's rb_io_set_nonblock by caching the
-// "nonblock" state in an instance variable. Calling rb_ivar_get on every read
-// is still much cheaper than doing a fcntl syscall on every read! Preliminary
-// benchmarks (with a "hello world" HTTP server) show throughput is improved
-// by 10-13%.
-inline void io_set_nonblock(rb_io_t *fptr, VALUE io) {
-  VALUE is_nonblocking = rb_ivar_get(io, ID_ivar_is_nonblocking);
-  if (is_nonblocking == Qtrue) return;
-
-  rb_ivar_set(io, ID_ivar_is_nonblocking, Qtrue);
-
-#ifdef _WIN32
-  rb_w32_set_nonblock(fptr->fd);
-#elif defined(F_GETFL)
-  int oflags = fcntl(fptr->fd, F_GETFL);
-  if ((oflags == -1) && (oflags & O_NONBLOCK)) return;
-  oflags |= O_NONBLOCK;
-  fcntl(fptr->fd, F_SETFL, oflags);
-#endif
-}
 
 typedef struct Scheduler_t {
   struct ev_loop *ev_loop;
   struct ev_async break_async;
 
+  unsigned int pending_count;
   unsigned int currently_polling;
   VALUE ready; // holds ready fibers (used only while polling)
 } Scheduler_t;
@@ -51,9 +33,14 @@ static size_t Scheduler_size(const void *ptr) {
   return sizeof(Scheduler_t);
 }
 
+static void Scheduler_mark(void *ptr) {
+  Scheduler_t *scheduler = ptr;
+  rb_gc_mark(scheduler->ready);
+}
+
 static const rb_data_type_t Scheduler_type = {
     "LibevScheduler",
-    {0, 0, Scheduler_size,},
+    {Scheduler_mark, 0, Scheduler_size,},
     0, 0, RUBY_TYPED_FREE_IMMEDIATELY
 };
 
@@ -83,7 +70,9 @@ static VALUE Scheduler_initialize(VALUE self) {
   ev_async_start(scheduler->ev_loop, &scheduler->break_async);
   ev_unref(scheduler->ev_loop); // don't count the break_async watcher
 
+  scheduler->pending_count = 0;
   scheduler->currently_polling = 0;
+  scheduler->ready = rb_ary_new();
 
   return Qnil;
 }
@@ -94,10 +83,10 @@ VALUE Scheduler_close(VALUE self) {
   Scheduler_t *scheduler;
   GetScheduler(self, scheduler);
 
-  Scheduler_poll(self);
-
+  while (scheduler->pending_count > 0) {
+    Scheduler_poll(self);
+  }
   ev_async_stop(scheduler->ev_loop, &scheduler->break_async);
-
   if (!ev_is_default_loop(scheduler->ev_loop)) ev_loop_destroy(scheduler->ev_loop);
   return self;
 }
@@ -110,22 +99,24 @@ struct libev_timer {
 
 void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents)
 {
-  struct libev_timer *timer = (struct libev_timer *)w;
-  rb_ary_push(timer->scheduler->ready, timer->fiber);
+  struct libev_timer *watcher = (struct libev_timer *)w;
+  rb_ary_push(watcher->scheduler->ready, watcher->fiber);
 }
 
 VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   Scheduler_t *scheduler;
-  struct libev_timer timer;
+  struct libev_timer watcher;
   GetScheduler(self, scheduler);
 
-  timer.scheduler = scheduler;
-  timer.fiber = rb_fiber_current();
-  ev_timer_init(&timer.timer, Scheduler_timer_callback, NUM2DBL(duration), 0.);
-  ev_timer_start(scheduler->ev_loop, &timer.timer);
+  watcher.scheduler = scheduler;
+  watcher.fiber = rb_fiber_current();
+  ev_timer_init(&watcher.timer, Scheduler_timer_callback, NUM2DBL(duration), 0.);
+  ev_timer_start(scheduler->ev_loop, &watcher.timer);
   VALUE nil = Qnil;
+  scheduler->pending_count++;
   VALUE ret = rb_fiber_yield(1, &nil);
-  ev_timer_stop(scheduler->ev_loop, &timer.timer);
+  scheduler->pending_count--;
+  ev_timer_stop(scheduler->ev_loop, &watcher.timer);
   return ret;
 }
 
@@ -135,7 +126,9 @@ VALUE Scheduler_pause(VALUE self) {
 
   ev_ref(scheduler->ev_loop);
   VALUE nil = Qnil;
+  scheduler->pending_count++;
   VALUE ret = rb_fiber_yield(1, &nil);
+  scheduler->pending_count--;
   ev_unref(scheduler->ev_loop);
   return ret;
 }
@@ -143,20 +136,76 @@ VALUE Scheduler_pause(VALUE self) {
 VALUE Scheduler_block(int argc, VALUE *argv, VALUE self) {
   VALUE timeout = (argc == 2) ? argv[1] : Qnil;
 
-  if (timeout != Qnil) return Scheduler_sleep(self, timeout);
+  if (timeout != Qnil)
+    return Scheduler_sleep(self, timeout);
   return Scheduler_pause(self);
 }
 
 VALUE Scheduler_unblock(VALUE self, VALUE blocker, VALUE fiber) {
-  printf("unblock?\n");
+  Scheduler_t *scheduler;
+  GetScheduler(self, scheduler);
+
+  rb_ary_push(scheduler->ready, fiber);
+
+  if (scheduler->currently_polling)
+    ev_async_send(scheduler->ev_loop, &scheduler->break_async);
+
   return self;
 }
 
+struct libev_io {
+  struct ev_io io;
+  Scheduler_t *scheduler;
+  VALUE fiber;
+};
 
+void Scheduler_io_callback(EV_P_ ev_io *w, int revents)
+{
+  struct libev_io *watcher = (struct libev_io *)w;
+  rb_ary_push(watcher->scheduler->ready, watcher->fiber);
+}
 
+int io_event_mask(VALUE events) {
+  int interest = NUM2INT(events);
+  int mask = 0;
+  if (interest & event_readable) mask |= EV_READ;
+  if (interest & event_writable) mask |= EV_WRITE;
+  return mask;
+}
 
+VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE timeout) {
+  Scheduler_t *scheduler;
+  struct libev_io io_watcher;
+  struct libev_timer timeout_watcher;
+  GetScheduler(self, scheduler);
 
-VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE duration) {
+  rb_io_t *fptr;
+  VALUE underlying_io = rb_ivar_get(io, ID_ivar_io);
+  if (underlying_io != Qnil) io = underlying_io;
+  GetOpenFile(io, fptr);
+
+  io_watcher.scheduler = scheduler;
+  io_watcher.fiber = rb_fiber_current();
+  ev_io_init(&io_watcher.io, Scheduler_io_callback, fptr->fd, io_event_mask(events));
+
+  int use_timeout = timeout != Qnil;
+  if (use_timeout) {
+    printf("with timeout\n");
+    timeout_watcher.scheduler = scheduler;
+    timeout_watcher.fiber = rb_fiber_current();
+    ev_timer_init(&timeout_watcher.timer, Scheduler_timer_callback, NUM2DBL(timeout), 0.);
+    ev_timer_start(scheduler->ev_loop, &timeout_watcher.timer);
+  }
+
+  ev_io_start(scheduler->ev_loop, &io_watcher.io);
+  VALUE nil = Qnil;
+  scheduler->pending_count++;
+  rb_fiber_yield(1, &nil);
+  scheduler->pending_count--;
+  ev_io_stop(scheduler->ev_loop, &io_watcher.io);
+  if (use_timeout)
+    ev_timer_stop(scheduler->ev_loop, &timeout_watcher.timer);
+  
   return self;
 }
 
@@ -168,7 +217,6 @@ VALUE Scheduler_poll(VALUE self) {
   Scheduler_t *scheduler;
   GetScheduler(self, scheduler);
 
-  scheduler->ready = rb_ary_new();
   scheduler->currently_polling = 1;
   ev_run(scheduler->ev_loop, EVRUN_ONCE);
   scheduler->currently_polling = 0;
@@ -179,78 +227,9 @@ VALUE Scheduler_poll(VALUE self) {
     VALUE fiber = RARRAY_AREF(scheduler->ready, i);
     rb_fiber_resume(fiber, 1, &nil);
   }
-
-  RB_GC_GUARD(scheduler->ready);
+  rb_ary_clear(scheduler->ready);
 
   return self;
-}
-
-VALUE Scheduler_wakeup(VALUE self) {
-  Scheduler_t *backend;
-  GetScheduler(self, backend);
-
-  if (backend->currently_polling) {
-    // Since the loop will run until at least one event has occurred, we signal
-    // the selector's associated async watcher, which will cause the ev loop to
-    // return. In contrast to using `ev_break` to break out of the loop, which
-    // should be called from the same thread (from within the ev_loop), using an
-    // `ev_async` allows us to interrupt the event loop across threads.
-    ev_async_send(backend->ev_loop, &backend->break_async);
-    return Qtrue;
-  }
-
-  return Qnil;
-}
-
-struct libev_io {
-  struct ev_io io;
-  VALUE fiber;
-};
-
-void Scheduler_io_callback(EV_P_ ev_io *w, int revents)
-{
-  struct libev_io *watcher = (struct libev_io *)w;
-  Fiber_make_runnable(watcher->fiber, Qnil);
-}
-
-VALUE libev_wait_fd_with_watcher(Scheduler_t *backend, int fd, struct libev_io *watcher, int events) {
-  VALUE switchpoint_result;
-
-  if (watcher->fiber == Qnil) {
-    watcher->fiber = rb_fiber_current();
-    ev_io_init(&watcher->io, Scheduler_io_callback, fd, events);
-  }
-  ev_io_start(backend->ev_loop, &watcher->io);
-
-  switchpoint_result = backend_await(backend);
-
-  ev_io_stop(backend->ev_loop, &watcher->io);
-  RB_GC_GUARD(switchpoint_result);
-  return switchpoint_result;
-}
-
-VALUE libev_wait_fd(Scheduler_t *backend, int fd, int events, int raise_exception) {
-  struct libev_io watcher;
-  VALUE switchpoint_result = Qnil;
-  watcher.fiber = Qnil;
-
-  switchpoint_result = libev_wait_fd_with_watcher(backend, fd, &watcher, events);
-
-  if (raise_exception) RAISE_IF_EXCEPTION(switchpoint_result);
-  RB_GC_GUARD(switchpoint_result);
-  return switchpoint_result;
-}
-
-VALUE Scheduler_wait_io(VALUE self, VALUE io, VALUE write) {
-  Scheduler_t *backend;
-  rb_io_t *fptr;
-  int events = RTEST(write) ? EV_WRITE : EV_READ;
-  VALUE underlying_io = rb_ivar_get(io, ID_ivar_io);
-  if (underlying_io != Qnil) io = underlying_io;
-  GetScheduler(self, backend);
-  GetOpenFile(io, fptr);
-
-  return libev_wait_fd(backend, fptr->fd, events, 1);
 }
 
 struct libev_child {
@@ -327,32 +306,10 @@ void Init_Scheduler() {
   rb_define_method(cScheduler, "block", Scheduler_block, -1);
   rb_define_method(cScheduler, "unblock", Scheduler_unblock, 2);
 
-  // rb_define_method(cScheduler, "finalize", Scheduler_finalize, 0);
-  // rb_define_method(cScheduler, "post_fork", Scheduler_post_fork, 0);
-
-  // rb_define_method(cScheduler, "poll", Scheduler_poll, 3);
-  // rb_define_method(cScheduler, "break", Scheduler_wakeup, 0);
-
-  // rb_define_method(cScheduler, "read", Scheduler_read, 4);
-  // rb_define_method(cScheduler, "read_loop", Scheduler_read_loop, 1);
-  // rb_define_method(cScheduler, "write", Scheduler_write_m, -1);
-  // rb_define_method(cScheduler, "accept", Scheduler_accept, 2);
-  // rb_define_method(cScheduler, "accept_loop", Scheduler_accept_loop, 2);
-  // rb_define_method(cScheduler, "connect", Scheduler_connect, 3);
-  // rb_define_method(cScheduler, "recv", Scheduler_recv, 3);
-  // rb_define_method(cScheduler, "recv_loop", Scheduler_read_loop, 1);
-  // rb_define_method(cScheduler, "send", Scheduler_write, 2);
-  // rb_define_method(cScheduler, "wait_io", Scheduler_wait_io, 2);
-  // rb_define_method(cScheduler, "sleep", Scheduler_sleep, 1);
-  // rb_define_method(cScheduler, "timer_loop", Scheduler_timer_loop, 1);
-  // rb_define_method(cScheduler, "timeout", Scheduler_timeout, -1);
-  // rb_define_method(cScheduler, "waitpid", Scheduler_waitpid, 1);
-  // rb_define_method(cScheduler, "wait_event", Scheduler_wait_event, 1);
-
-  // rb_define_method(cScheduler, "kind", Scheduler_kind, 0);
-
   ID_ivar_is_nonblocking = rb_intern("@is_nonblocking");
   ID_ivar_io             = rb_intern("@io");
 
+  event_readable = NUM2INT(rb_const_get(rb_cIO, rb_intern("READABLE")));
+  event_writable = NUM2INT(rb_const_get(rb_cIO, rb_intern("WRITABLE")));
   // SYM_libev = ID2SYM(rb_intern("libev"));
 }
