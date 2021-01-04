@@ -8,14 +8,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest ]
-        ruby: [ "3.0.0" ]
+        ruby: [ '3.0' ]
 
     name: >-
       ${{matrix.os}}, ${{matrix.ruby}}
 
     runs-on: ${{matrix.os}}
     steps:
-    - uses: actions/checkout@v1
+    - uses: actions/checkout@v2
     - uses: actions/setup-ruby@v1
       with:
         ruby-version: ${{matrix.ruby}}
