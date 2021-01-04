@@ -118,7 +118,7 @@ can in principle use `Fiber#transfer` to switch between fibers, which will allow
 pausing and resuming the main fiber, it does not seem as if the current design
 is really conductive to that.
 
-## The idea of multiple fiber scheduler implementations
+## On having multiple alternative fiber scheduler implementations
 
 It is unclear to me that there is really a need for multiple fiber scheduler
 implementations. First of all, the term "fiber scheduler" is a bit of a
@@ -135,16 +135,27 @@ Here's what it might look like (with the current capabilities):
 
 ```ruby
 class BlockingOperationsBackend
+  def poll(opts = {})
+    # example pseudo-code
+    ev_run(@ev_loop)    
+  end
+
   def io_wait(io, opts)
+    # example pseudo-code
+    fiber = Fiber.current
+    watcher = setup_watcher_for_io(io) do
+      Thread.current.schedule_fiber(fiber)
+    end
+    Fiber.yield
+    watcher.stop
   end
 
   def pid_wait(pid, opts)
+    ...
   end
 
   def sleep(duration)
-  end
-
-  def poll(opts = {})
+    ...
   end
 end
 ```
@@ -152,7 +163,26 @@ end
 The fiber scheduling part would provide a `Thread#schedule_fiber` method that
 adds the given fiber to the thread's run queue, and the thread will know when to
 call the backend's `#poll` method in order to poll for blocking operation
-completions.
+completions. For example:
+
+```ruby
+# somewhere in Ruby's kischkas:
+class Thread
+  def schedule_fiber(fiber)
+    @run_queue << fiber
+  end
+
+  def run_fiber_scheduler
+    @backend.poll
+    @run_queue.each { |f| f.resume }
+  end
+end
+```
 
 It seems to me this kind of design would be much easier to implement, and would
-lead to a lot less code duplication.
+lead to a lot less code duplication. This design could also be extended later to
+perform all kinds of blocking operations, such as reading/writing etc., as
+discussed above.
+
+Finally, such a design could also provide a C API for people writing extensions,
+so they can rely on it whenever doing any blocking call.
