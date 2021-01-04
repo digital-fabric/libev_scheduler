@@ -4,7 +4,8 @@ module Libev
   class Scheduler
     def fiber(&block)
       fiber = Fiber.new(blocking: false, &block)
-      fiber.resume
+      unblock(nil, fiber)
+      # fiber.resume
       return fiber
     end
 
@@ -12,8 +13,11 @@ module Libev
       block(:sleep, duration)
     end
 
-    def run
-      puts "run"
-    end
+    def process_wait(pid, flags)
+      # This is a very simple way to implement a non-blocking wait:
+      Thread.new do
+        Process::Status.wait(pid, flags)
+      end.value
+    end  
   end
 end
