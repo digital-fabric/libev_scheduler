@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    libev_scheduler (0.1)
+    libev_scheduler (0.2)
 
 GEM
   remote: https://rubygems.org/
