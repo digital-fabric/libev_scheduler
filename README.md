@@ -33,14 +33,13 @@ end
 
 Also have a look at the included tests and examples.
 
-## Some notes on the implementation
+## The scheduler implementation
 
 The present gem uses
 [libev](http://pod.tst.eu/http://cvs.schmorp.de/libev/ev.pod) to provide a
-performant, cross-platform fiber scheduler implementation for Ruby 3.0. While I
-intend to update the bundled libev code to the latest version, which includes an
-io_uring backend, it is unclear to me that this has real benefits (see below for
-more information).
+performant, cross-platform fiber scheduler implementation for Ruby 3.0. The
+bundled libev is version 4.33, which includes an (experimental) io_uring
+backend (more below about io_uring).
 
 ## Some thoughts on the Ruby fiber scheduler interface
 
@@ -59,36 +58,61 @@ includes methods for:
 However, the current design has some shortcomings that will need to be addressed
 in order for this feature to become useful. Here are some of my thoughts on this
 subject. Please do not take this as an attack on the wonderful work of the Ruby
-core developers. At worst I'm just some random guy being wrong on the internet
-:-p.
+core developers. Most probably I'm just some random guy being wrong on the
+internet :-p.
 
-## I/O readiness
+### Two kinds of fibers
+
+One of the changes made as part of the work on the fiber scheduler interface in
+Ruby 3.0 was to distinguish between two kinds of fibers: a normal, blocking
+fiber; and a non-blocking fiber, which can be used in conjunction with the fiber
+scheduler. While this was probably done for the sake of backward compatibility,
+I believe this is an error. In introduces ambiguity where previously there was
+none and makes the API more complex that it could have been.
+
+It seems to me that a more logical solution to the problem of maintaining the
+blocking behaviour by default, would be have been to set the non-blocking mode
+at the level of the thread, instead of the fiber. That also would have allowed
+using the main fiber (of a given thread) in a non-blocking manner (see below).
+
+### Performing blocking operations on the main fiber
+
+While I didn't scratch the surface too much in terms of the limits of the fiber
+scheduler interface, it looks pretty clear that the main fiber (in any thread)
+cannot be used in a non-blocking manner. While fiber scheduler implementations
+can in principle use `Fiber#transfer` to switch between fibers, which will allow
+pausing and resuming the main fiber, it does not seem as if the current design
+is really conductive to that.
+
+### I/O readiness
 
 In and of itself, checking for I/O readiness is nice, but it does not allow us
-to leverage the power of e.g. io_uring or IOCP in Windows. In order to leverage
-the advantages offered by io_uring, for instance, a fiber scheduler should be
-able to do much more than check for I/O readiness. It should be able, rather, to
-perform I/O operations including read/write, send/recv, connect and accept.
+to leverage the full power of io_uring on Linux or IOCP in Windows. In order to
+leverage the advantages offered by io_uring, for instance, a fiber scheduler
+should be able to do much more than just check for I/O readiness. It should be
+able, rather, to *perform* I/O operations including read/write, send/recv,
+connect and accept.
 
 This is of course no small undertaking, but the current Ruby [native I/O
 code](https://github.com/ruby/ruby/blob/master/io.c), currently at almost 14
 KLOCS, is IMHO ripe for some overhauling, and maybe some separation of concerns.
-It seems to me that at the API layer (e.g. the `IO` class) could be separated
-from the code that does the actual reading/writing etc. This is indeed the
-approach I took with [Polyphony](https://github.com/digital-fabric/polyphony/),
-which provides the same API for developers, but performs the I/O using a libev-
-or io_uring-based backend. This design can then reap all of the benefits of
-using io_uring. Such an approach could also allow allow us to implement I/O
-using IOCP on Windows (currently we can't because this requires files to be
-opened with `WSA_FLAG_OVERLAPPED`).
+It seems to me that the API layer for the `IO` class could be separated from the
+code that does the actual reading/writing etc. This is indeed the approach I
+took with [Polyphony](https://github.com/digital-fabric/polyphony/), which
+provides the same `IO` API for developers, but performs the I/O ops using a
+libev- or io_uring-based backend. This design can then reap all of the benefits
+of using io_uring. Such an approach could also allow us to implement I/O using
+IOCP on Windows (currently we can't because this requires files to be opened
+with `WSA_FLAG_OVERLAPPED`).
 
-This is also the reason I have decided to not release a native io_uring-backed
-fiber scheduler implementation, since I don't think it can provide a real
-benefit in terms of performance. If I/O readiness is all that the fiber
-scheduler can do, it's best to just use a cross-platform implementation such as
-libev, which can then use io_uring behind the scenes.
+This is also the reason I have decided not to release a native io_uring-backed
+fiber scheduler implementation (with code extracted from Polyphony), since I
+don't believe it can provide any real benefit in terms of performance. If I/O
+readiness is all that the fiber scheduler can do, it's probably best to just use
+a cross-platform implementation such as libev, which can then use io_uring
+behind the scenes.
 
-## Waiting for processes
+### Waiting for processes
 
 The problem with the current design is that the `#process_wait` method is
 expected to return an instance of `Process::Status`. Unfortunately, this class
@@ -109,23 +133,21 @@ change the API such that `#process_wait` returns an array containing the pid and
 its status, for example. This can then be used to instantiate a
 `Process::Status` object somewhere inside `Process.wait`.
 
-## Performing blocking operations on the main fiber
-
-While I didn't scratch the surface too much in terms of the limits of the fiber
-scheduler interface, it looks pretty clear that the main fiber (in any thread)
-cannot be used in a non-blocking manner. While fiber scheduler implementations
-can in principle use `Fiber#transfer` to switch between fibers, which will allow
-pausing and resuming the main fiber, it does not seem as if the current design
-is really conductive to that.
-
-## On having multiple alternative fiber scheduler implementations
+### On having multiple alternative fiber scheduler implementations
 
 It is unclear to me that there is really a need for multiple fiber scheduler
-implementations. First of all, the term "fiber scheduler" is a bit of a
-misnomer, since it doesn't really deal with *scheduling* fibers, but really with
-*performing blocking operations in a fiber-aware manner*. The scheduling part is
-in many ways trivial (i.e. the scheduler holds an array of fibers ready to run),
-but the performing of blocking operations is [much more
+implementations. It seems to me that an approach using multiple backends
+selected according to the OS, is much more appropriate. It's not like there's
+going to be a dozen different implementations of fiber schedulers. Actually,
+libev fits really nicely here, since it already includes all those different
+backends.
+
+
+Besides, the term "fiber scheduler" is a bit of a misnomer, since it doesn't
+really deal with *scheduling* fibers, but really with *performing blocking
+operations in a fiber-aware manner*. The scheduling part is in many ways trivial
+(i.e. the scheduler holds an array of fibers ready to run), but the performing
+of blocking operations is [much more
 involved](https://github.com/digital-fabric/polyphony/blob/master/ext/polyphony/backend_io_uring.c).
 
 There is of course quite a bit of interaction between the scheduling part and
