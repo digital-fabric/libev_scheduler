@@ -67,7 +67,7 @@ One of the changes made as part of the work on the fiber scheduler interface in
 Ruby 3.0 was to distinguish between two kinds of fibers: a normal, blocking
 fiber; and a non-blocking fiber, which can be used in conjunction with the fiber
 scheduler. While this was probably done for the sake of backward compatibility,
-I believe this is an error. In introduces ambiguity where previously there was
+I believe this is an error. It introduces ambiguity where previously there was
 none and makes the API more complex that it could have been.
 
 It seems to me that a more logical solution to the problem of maintaining the
@@ -82,7 +82,8 @@ scheduler interface, it looks pretty clear that the main fiber (in any thread)
 cannot be used in a non-blocking manner. While fiber scheduler implementations
 can in principle use `Fiber#transfer` to switch between fibers, which will allow
 pausing and resuming the main fiber, it does not seem as if the current design
-is really conductive to that.
+is really conductive to that. Again, as discussed above, this can lead to
+confusion.
 
 ### I/O readiness
 
