@@ -39,7 +39,7 @@ The present gem uses
 [libev](http://pod.tst.eu/http://cvs.schmorp.de/libev/ev.pod) to provide a
 performant, cross-platform fiber scheduler implementation for Ruby 3.0. The
 bundled libev is version 4.33, which includes an (experimental) io_uring
-backend (more below about io_uring).
+backend.
 
 ## Some thoughts on the Ruby fiber scheduler interface
 
@@ -84,34 +84,6 @@ can in principle use `Fiber#transfer` to switch between fibers, which will allow
 pausing and resuming the main fiber, it does not seem as if the current design
 is really conductive to that. Again, as discussed above, this can lead to
 confusion.
-
-### I/O readiness
-
-In and of itself, checking for I/O readiness is nice, but it does not allow us
-to leverage the full power of io_uring on Linux or IOCP in Windows. In order to
-leverage the advantages offered by io_uring, for instance, a fiber scheduler
-should be able to do much more than just check for I/O readiness. It should be
-able, rather, to *perform* I/O operations including read/write, send/recv,
-connect and accept.
-
-This is of course no small undertaking, but the current Ruby [native I/O
-code](https://github.com/ruby/ruby/blob/master/io.c), currently at almost 14
-KLOCS, is IMHO ripe for some overhauling, and maybe some separation of concerns.
-It seems to me that the API layer for the `IO` class could be separated from the
-code that does the actual reading/writing etc. This is indeed the approach I
-took with [Polyphony](https://github.com/digital-fabric/polyphony/), which
-provides the same `IO` API for developers, but performs the I/O ops using a
-libev- or io_uring-based backend. This design can then reap all of the benefits
-of using io_uring. Such an approach could also allow us to implement I/O using
-IOCP on Windows (currently we can't because this requires files to be opened
-with `WSA_FLAG_OVERLAPPED`).
-
-This is also the reason I have decided not to release a native io_uring-backed
-fiber scheduler implementation (with code extracted from Polyphony), since I
-don't believe it can provide any real benefit in terms of performance. If I/O
-readiness is all that the fiber scheduler can do, it's probably best to just use
-a cross-platform implementation such as libev, which can then use io_uring
-behind the scenes.
 
 ### Waiting for processes
 
