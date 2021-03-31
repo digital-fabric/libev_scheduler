@@ -3,6 +3,7 @@ require 'bundler/setup'
 require 'minitest/autorun'
 require 'minitest/reporters'
 require 'libev_scheduler'
+require 'io/wait'
 
 class TestFiberIO < MiniTest::Test
   MESSAGE = "Hello World"
@@ -17,11 +18,13 @@ class TestFiberIO < MiniTest::Test
       Fiber.set_scheduler scheduler
 
       Fiber.schedule do
+        assert i.wait_readable
         message = i.read(20)
         i.close
       end
 
       Fiber.schedule do
+        assert o.wait_writable
         o.write("Hello World")
         o.close
       end
@@ -53,5 +56,23 @@ class TestFiberIO < MiniTest::Test
         end
       end
     end.each(&:join)
+  end
+
+  def test_timeout
+    i, o = IO.pipe
+
+    thread = Thread.new do
+      scheduler = Libev::Scheduler.new
+      Fiber.set_scheduler scheduler
+
+      Fiber.schedule do
+        assert_nil i.wait_readable(0.1)
+        assert_raises IO::WaitReadable do
+          i.read_nonblock(1)
+        end
+      end
+    end
+
+    thread.join
   end
 end
