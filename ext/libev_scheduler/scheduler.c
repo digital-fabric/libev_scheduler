@@ -219,10 +219,13 @@ VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE timeout) {
   rb_fiber_yield(1, &nil);
   scheduler->pending_count--;
   ev_io_stop(scheduler->ev_loop, &io_watcher.io);
-  if (use_timeout)
+  if (use_timeout) {
     ev_timer_stop(scheduler->ev_loop, &timeout_watcher.timer);
-  
-  return self;
+    if (ev_timer_remaining(scheduler->ev_loop, &timeout_watcher.timer) <= 0)
+      return nil;
+  }
+
+  return events;
 }
 
 struct libev_child {
