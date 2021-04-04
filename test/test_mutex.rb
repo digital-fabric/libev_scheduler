@@ -73,7 +73,6 @@ class TestFiberMutex < MiniTest::Test
   end
 
   def test_mutex_fiber_raise
-    skip "stuck"
     mutex = Mutex.new
     ran = false
 
@@ -87,7 +86,7 @@ class TestFiberMutex < MiniTest::Test
         Fiber.set_scheduler scheduler
 
         f = Fiber.schedule do
-          assert_raise_message("bye") do
+          assert_raises(RuntimeError) do
             p [2, :pre_lock]
             mutex.lock
             p [2, :post_lock]
