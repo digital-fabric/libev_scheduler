@@ -12,25 +12,31 @@
 #include "ruby/io.h"
 #include "../libev/ev.h"
 
-#define INSPECT(str, obj) { printf(str); VALUE s = rb_funcall(obj, rb_intern("inspect"), 0); printf(": %s\n", StringValueCStr(s)); }
-#define TRACE_CALLER() { VALUE c = rb_funcall(rb_mKernel, rb_intern("caller"), 0); INSPECT("caller: ", c); }
-
+// Some debugging facilities
+#define INSPECT(str, obj) { \
+  printf(str); \
+  VALUE s = rb_funcall(obj, rb_intern("inspect"), 0); \
+  printf(": %s\n", StringValueCStr(s)); \
+}
+#define TRACE_CALLER() { \
+  VALUE c = rb_funcall(rb_mKernel, rb_intern("caller"), 0); \
+  INSPECT("caller: ", c); \
+}
 
 ID ID_ivar_is_nonblocking;
 ID ID_ivar_io;
 
+// IO event mask (from IO::READABLE & IO::WRITEABLE)
 int event_readable;
 int event_writable;
 
-// VALUE SYM_libev;
-
 typedef struct Scheduler_t {
   struct ev_loop *ev_loop;
-  struct ev_async break_async;
+  struct ev_async break_async; // used for breaking out of blocking event loop
 
   unsigned int pending_count;
   unsigned int currently_polling;
-  VALUE ready; // holds ready fibers (used only while polling)
+  VALUE ready_fibers;
 } Scheduler_t;
 
 static size_t Scheduler_size(const void *ptr) {
@@ -39,7 +45,7 @@ static size_t Scheduler_size(const void *ptr) {
 
 static void Scheduler_mark(void *ptr) {
   Scheduler_t *scheduler = ptr;
-  rb_gc_mark(scheduler->ready);
+  rb_gc_mark(scheduler->ready_fibers);
 }
 
 static const rb_data_type_t Scheduler_type = {
@@ -76,7 +82,7 @@ static VALUE Scheduler_initialize(VALUE self) {
 
   scheduler->pending_count = 0;
   scheduler->currently_polling = 0;
-  scheduler->ready = rb_ary_new();
+  scheduler->ready_fibers = rb_ary_new();
 
   return Qnil;
 }
@@ -87,7 +93,7 @@ VALUE Scheduler_run(VALUE self) {
   Scheduler_t *scheduler;
   GetScheduler(self, scheduler);
 
-  while (scheduler->pending_count > 0 || RARRAY_LEN(scheduler->ready) > 0) {
+  while (scheduler->pending_count > 0 || RARRAY_LEN(scheduler->ready_fibers) > 0) {
     Scheduler_poll(self);
   }
 
@@ -111,20 +117,23 @@ struct libev_timer {
   VALUE fiber;
 };
 
-void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents)
-{
+#define SCHEDULE(scheduler, fiber) rb_ary_push((scheduler)->ready_fibers, fiber)
+
+void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents) {
   struct libev_timer *watcher = (struct libev_timer *)w;
-  rb_ary_push(watcher->scheduler->ready, watcher->fiber);
+  SCHEDULE(watcher->scheduler, watcher->fiber);
 }
 
-VALUE rb_fiber_yield_value(VALUE value) {
+VALUE rb_fiber_yield_value(VALUE _value) {
   VALUE nil = Qnil;
   return rb_fiber_yield(1, &nil);
 }
 
-VALUE rb_fiber_yield_rescue(VALUE value, VALUE err) {
+VALUE rb_fiber_yield_rescue(VALUE _value, VALUE err) {
   return err;
 }
+
+#define YIELD() rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException)
 
 VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   Scheduler_t *scheduler;
@@ -137,7 +146,7 @@ VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   ev_timer_start(scheduler->ev_loop, &watcher.timer);
   VALUE nil = Qnil;
   scheduler->pending_count++;
-  VALUE ret = rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException);
+  VALUE ret = YIELD();
   scheduler->pending_count--;
   ev_timer_stop(scheduler->ev_loop, &watcher.timer);
   if (ret != nil) rb_exc_raise(ret);
@@ -151,7 +160,7 @@ VALUE Scheduler_pause(VALUE self) {
   ev_ref(scheduler->ev_loop);
   VALUE nil = Qnil;
   scheduler->pending_count++;
-  VALUE ret = rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException);
+  VALUE ret = YIELD();
   scheduler->pending_count--;
   ev_unref(scheduler->ev_loop);
   if (ret != nil) rb_exc_raise(ret);
@@ -172,7 +181,7 @@ VALUE Scheduler_unblock(VALUE self, VALUE blocker, VALUE fiber) {
   Scheduler_t *scheduler;
   GetScheduler(self, scheduler);
 
-  rb_ary_push(scheduler->ready, fiber);
+  SCHEDULE(scheduler, fiber);
 
   if (scheduler->currently_polling)
     ev_async_send(scheduler->ev_loop, &scheduler->break_async);
@@ -189,7 +198,7 @@ struct libev_io {
 void Scheduler_io_callback(EV_P_ ev_io *w, int revents)
 {
   struct libev_io *watcher = (struct libev_io *)w;
-  rb_ary_push(watcher->scheduler->ready, watcher->fiber);
+  SCHEDULE(watcher->scheduler, watcher->fiber);
 }
 
 int io_event_mask(VALUE events) {
@@ -226,7 +235,7 @@ VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE timeout) {
   ev_io_start(scheduler->ev_loop, &io_watcher.io);
   VALUE nil = Qnil;
   scheduler->pending_count++;
-  VALUE ret = rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException);
+  VALUE ret = YIELD();
   scheduler->pending_count--;
   ev_io_stop(scheduler->ev_loop, &io_watcher.io);
   if (use_timeout)
@@ -249,11 +258,10 @@ struct libev_child {
 
 void Scheduler_child_callback(EV_P_ ev_child *w, int revents)
 {
-  printf("Scheduler_child_callback\n");
   struct libev_child *watcher = (struct libev_child *)w;
   int exit_status = WEXITSTATUS(w->rstatus);
   watcher->status = rb_ary_new_from_args(2, INT2NUM(w->rpid), INT2NUM(exit_status));
-  rb_ary_push(watcher->scheduler->ready, watcher->fiber);
+  SCHEDULE(watcher->scheduler, watcher->fiber);
 }
 
 VALUE Scheduler_process_wait(VALUE self, VALUE pid, VALUE flags) {
@@ -279,22 +287,22 @@ VALUE Scheduler_process_wait(VALUE self, VALUE pid, VALUE flags) {
 
 void Scheduler_resume_ready(Scheduler_t *scheduler) {
   VALUE nil = Qnil;
-  VALUE ready = Qnil;
+  VALUE ready_fibers = Qnil;
 
-  unsigned int ready_count = RARRAY_LEN(scheduler->ready);
+  unsigned int ready_count = RARRAY_LEN(scheduler->ready_fibers);
   while (ready_count > 0) {
-    ready = scheduler->ready;
-    scheduler->ready = rb_ary_new();
+    ready_fibers = scheduler->ready_fibers;
+    scheduler->ready_fibers = rb_ary_new();
 
     for (unsigned int i = 0; i < ready_count; i++) {
-      VALUE fiber = RARRAY_AREF(ready, i);
+      VALUE fiber = RARRAY_AREF(ready_fibers, i);
       rb_fiber_resume(fiber, 1, &nil);
     }
 
-    ready_count = RARRAY_LEN(scheduler->ready);
+    ready_count = RARRAY_LEN(scheduler->ready_fibers);
   }
 
-  RB_GC_GUARD(ready);
+  RB_GC_GUARD(ready_fibers);
 }
 
 VALUE Scheduler_poll(VALUE self) {
@@ -341,5 +349,4 @@ void Init_Scheduler() {
 
   event_readable = NUM2INT(rb_const_get(rb_cIO, rb_intern("READABLE")));
   event_writable = NUM2INT(rb_const_get(rb_cIO, rb_intern("WRITABLE")));
-  // SYM_libev = ID2SYM(rb_intern("libev"));
 }

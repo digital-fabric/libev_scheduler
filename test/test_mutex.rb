@@ -77,9 +77,7 @@ class TestFiberMutex < MiniTest::Test
     ran = false
 
     main = Thread.new do
-      p [1, :pre_lock]
       mutex.lock
-      p [1, :post_lock]
 
       thread = Thread.new do
         scheduler = Libev::Scheduler.new
@@ -87,18 +85,14 @@ class TestFiberMutex < MiniTest::Test
 
         f = Fiber.schedule do
           assert_raises(RuntimeError) do
-            p [2, :pre_lock]
             mutex.lock
-            p [2, :post_lock]
           end
 
           ran = true
         end
 
         Fiber.schedule do
-          p [3, :pre_raise]
           f.raise "bye"
-          p [3, :post_raise]
         end
       end
 
