@@ -117,6 +117,15 @@ void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents)
   rb_ary_push(watcher->scheduler->ready, watcher->fiber);
 }
 
+VALUE rb_fiber_yield_value(VALUE value) {
+  VALUE nil = Qnil;
+  return rb_fiber_yield(1, &nil);
+}
+
+VALUE rb_fiber_yield_rescue(VALUE value, VALUE err) {
+  return err;
+}
+
 VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   Scheduler_t *scheduler;
   struct libev_timer watcher;
@@ -128,9 +137,10 @@ VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   ev_timer_start(scheduler->ev_loop, &watcher.timer);
   VALUE nil = Qnil;
   scheduler->pending_count++;
-  VALUE ret = rb_fiber_yield(1, &nil);
+  VALUE ret = rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException);
   scheduler->pending_count--;
   ev_timer_stop(scheduler->ev_loop, &watcher.timer);
+  if (ret != nil) rb_exc_raise(ret);
   return ret;
 }
 
@@ -141,15 +151,15 @@ VALUE Scheduler_pause(VALUE self) {
   ev_ref(scheduler->ev_loop);
   VALUE nil = Qnil;
   scheduler->pending_count++;
-  VALUE ret = rb_fiber_yield(1, &nil);
+  VALUE ret = rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException);
   scheduler->pending_count--;
   ev_unref(scheduler->ev_loop);
+  if (ret != nil) rb_exc_raise(ret);
   return ret;
 }
 
 VALUE Scheduler_block(int argc, VALUE *argv, VALUE self) {
   VALUE timeout = (argc == 2) ? argv[1] : Qnil;
-
   if (timeout != Qnil)
     Scheduler_sleep(self, timeout);
   else
@@ -216,14 +226,16 @@ VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE timeout) {
   ev_io_start(scheduler->ev_loop, &io_watcher.io);
   VALUE nil = Qnil;
   scheduler->pending_count++;
-  rb_fiber_yield(1, &nil);
+  VALUE ret = rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException);
   scheduler->pending_count--;
   ev_io_stop(scheduler->ev_loop, &io_watcher.io);
-  if (use_timeout) {
+  if (use_timeout)
     ev_timer_stop(scheduler->ev_loop, &timeout_watcher.timer);
-    if (ev_timer_remaining(scheduler->ev_loop, &timeout_watcher.timer) <= 0)
-      return nil;
-  }
+
+  if (ret != nil) rb_exc_raise(ret);
+
+  if (use_timeout && ev_timer_remaining(scheduler->ev_loop, &timeout_watcher.timer) <= 0)
+    return nil;
 
   return events;
 }

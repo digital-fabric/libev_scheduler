@@ -49,4 +49,21 @@ class TestFiberSleep < MiniTest::Test
     assert_operator seconds, :>=, 1.0, "actual: %p" % seconds
     assert_operator elapsed, :>=, 1.0, "actual: %p" % elapsed
   end
+
+  def test_raise_exits_sleep
+    finished = false
+    thread = Thread.new do
+      scheduler = Libev::Scheduler.new
+      Fiber.set_scheduler scheduler
+      f = Fiber.schedule do
+        sleep
+      rescue
+        finished = true
+      end
+      Fiber.schedule {f.raise}
+    end
+
+    thread.join
+    assert finished
+  end
 end
