@@ -13,7 +13,7 @@
 </p>
 
 `libev_scheduler` is a libev-based fiber scheduler for Ruby 3.0 based on code
-extracted from [Polyphony](https://github.com/digital-fabric/libev_scheduler).
+extracted from [Polyphony](https://github.com/digital-fabric/polyphony).
 
 ## Installing
 
