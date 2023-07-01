@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 require 'bundler/setup'
 require 'minitest/autorun'
-require 'minitest/reporters'
 require 'libev_scheduler'
 
 class TestFiberProcess < MiniTest::Test

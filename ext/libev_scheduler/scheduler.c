@@ -25,6 +25,7 @@
 
 ID ID_ivar_is_nonblocking;
 ID ID_ivar_io;
+VALUE VALUE_nil;
 
 // IO event mask (from IO::READABLE & IO::WRITEABLE)
 int event_readable;
@@ -125,15 +126,14 @@ void Scheduler_timer_callback(EV_P_ ev_timer *w, int revents) {
 }
 
 VALUE rb_fiber_yield_value(VALUE _value) {
-  VALUE nil = Qnil;
-  return rb_fiber_yield(1, &nil);
+  return rb_fiber_yield(1, &VALUE_nil);
 }
 
 VALUE rb_fiber_yield_rescue(VALUE _value, VALUE err) {
   return err;
 }
 
-#define YIELD() rb_rescue2(rb_fiber_yield_value, nil, rb_fiber_yield_rescue, nil, rb_eException)
+#define YIELD() rb_rescue2(rb_fiber_yield_value, VALUE_nil, rb_fiber_yield_rescue, VALUE_nil, rb_eException)
 
 VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   Scheduler_t *scheduler;
@@ -144,12 +144,13 @@ VALUE Scheduler_sleep(VALUE self, VALUE duration) {
   watcher.fiber = rb_fiber_current();
   ev_timer_init(&watcher.timer, Scheduler_timer_callback, NUM2DBL(duration), 0.);
   ev_timer_start(scheduler->ev_loop, &watcher.timer);
-  VALUE nil = Qnil;
   scheduler->pending_count++;
   VALUE ret = YIELD();
   scheduler->pending_count--;
   ev_timer_stop(scheduler->ev_loop, &watcher.timer);
-  if (ret != nil) rb_exc_raise(ret);
+  if (!NIL_P(ret)) rb_exc_raise(ret);
+  RB_GC_GUARD(watcher.fiber);
+  RB_GC_GUARD(ret);
   return ret;
 }
 
@@ -158,12 +159,11 @@ VALUE Scheduler_pause(VALUE self) {
   GetScheduler(self, scheduler);
 
   ev_ref(scheduler->ev_loop);
-  VALUE nil = Qnil;
   scheduler->pending_count++;
   VALUE ret = YIELD();
   scheduler->pending_count--;
   ev_unref(scheduler->ev_loop);
-  if (ret != nil) rb_exc_raise(ret);
+  if (!NIL_P(ret)) rb_exc_raise(ret);
   return ret;
 }
 
@@ -233,7 +233,6 @@ VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE timeout) {
   }
 
   ev_io_start(scheduler->ev_loop, &io_watcher.io);
-  VALUE nil = Qnil;
   scheduler->pending_count++;
   VALUE ret = YIELD();
   scheduler->pending_count--;
@@ -241,10 +240,10 @@ VALUE Scheduler_io_wait(VALUE self, VALUE io, VALUE events, VALUE timeout) {
   if (use_timeout)
     ev_timer_stop(scheduler->ev_loop, &timeout_watcher.timer);
 
-  if (ret != nil) rb_exc_raise(ret);
+  if (!NIL_P(ret)) rb_exc_raise(ret);
 
   if (use_timeout && ev_timer_remaining(scheduler->ev_loop, &timeout_watcher.timer) <= 0)
-    return nil;
+    return VALUE_nil;
 
   return events;
 }
@@ -275,9 +274,8 @@ VALUE Scheduler_process_wait(VALUE self, VALUE pid, VALUE flags) {
   watcher.status = Qnil;
   ev_child_init(&watcher.child, Scheduler_child_callback, NUM2INT(pid), 0);
   ev_child_start(scheduler->ev_loop, &watcher.child);
-  VALUE nil = Qnil;
   scheduler->pending_count++;
-  rb_fiber_yield(1, &nil);
+  rb_fiber_yield(1, &VALUE_nil);
   scheduler->pending_count--;
   ev_child_stop(scheduler->ev_loop, &watcher.child);
   RB_GC_GUARD(watcher.status);
@@ -286,7 +284,6 @@ VALUE Scheduler_process_wait(VALUE self, VALUE pid, VALUE flags) {
 }
 
 void Scheduler_resume_ready(Scheduler_t *scheduler) {
-  VALUE nil = Qnil;
   VALUE ready_fibers = Qnil;
 
   unsigned int ready_count = RARRAY_LEN(scheduler->ready_fibers);
@@ -296,7 +293,7 @@ void Scheduler_resume_ready(Scheduler_t *scheduler) {
 
     for (unsigned int i = 0; i < ready_count; i++) {
       VALUE fiber = RARRAY_AREF(ready_fibers, i);
-      rb_fiber_resume(fiber, 1, &nil);
+      rb_fiber_resume(fiber, 1, &VALUE_nil);
     }
 
     ready_count = RARRAY_LEN(scheduler->ready_fibers);
@@ -346,6 +343,8 @@ void Init_Scheduler() {
 
   ID_ivar_is_nonblocking = rb_intern("@is_nonblocking");
   ID_ivar_io             = rb_intern("@io");
+  VALUE_nil              = Qnil;
+  rb_global_variable(&VALUE_nil);
 
   event_readable = NUM2INT(rb_const_get(rb_cIO, rb_intern("READABLE")));
   event_writable = NUM2INT(rb_const_get(rb_cIO, rb_intern("WRITABLE")));
